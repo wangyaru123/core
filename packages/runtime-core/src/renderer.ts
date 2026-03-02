@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 import {
   Comment,
   Fragment,
@@ -45,9 +46,10 @@ import {
   type SchedulerJobs,
   flushPostFlushCbs,
   flushPreFlushCbs,
-  queueJob,
   queuePostFlushCb,
 } from './scheduler'
+// queueJob,
+import { createAdaptiveScheduler, initAdaptiveScheduler } from './newScheduler'
 import {
   EffectFlags,
   ReactiveEffect,
@@ -86,6 +88,9 @@ import { isAsyncWrapper } from './apiAsyncComponent'
 import { isCompatEnabled } from './compat/compatConfig'
 import { DeprecationTypes } from './compat/compatConfig'
 import type { TransitionHooks } from './components/BaseTransition'
+
+// 确保只初始化一次
+let adaptiveSchedulerInitialized = false
 
 export interface Renderer<HostElement = RendererElement> {
   render: RootRenderFunction<HostElement>
@@ -313,6 +318,26 @@ export function createRenderer<
   HostNode = RendererNode,
   HostElement = RendererElement,
 >(options: RendererOptions<HostNode, HostElement>): Renderer<HostElement> {
+  // 创建Vue原生的渲染器
+  // const renderer = baseCreateRenderer(options) as any
+
+  // // 获取原有的调度器
+  // const originalScheduler = (renderer as any).scheduler
+
+  // // 创建自适应调度器
+  // const adaptiveScheduler = new AdaptiveScheduler(originalScheduler)
+
+  // // 重写effect创建逻辑，接入自定义调度器
+  // const originalEffect = renderer.effect
+  // renderer.effect = (fn: Function, options?: any) => {
+  //   return originalEffect(fn, {
+  //     ...options,
+  //     scheduler: adaptiveScheduler.schedule.bind(adaptiveScheduler),
+  //   })
+  // }
+
+  // return renderer
+  // 原来
   return baseCreateRenderer<HostNode, HostElement>(options)
 }
 
@@ -1281,6 +1306,15 @@ function baseCreateRenderer(
     namespace: ElementNamespace,
     optimized,
   ) => {
+    // 确保调度器已初始化
+    if (!adaptiveSchedulerInitialized) {
+      initAdaptiveScheduler()
+      adaptiveSchedulerInitialized = true
+    }
+    console.log('setupRenderEffect', adaptiveSchedulerInitialized)
+
+    const scheduler = createAdaptiveScheduler(instance)
+
     const componentUpdateFn = () => {
       if (!instance.isMounted) {
         let vnodeHook: VNodeHook | null | undefined
@@ -1554,15 +1588,22 @@ function baseCreateRenderer(
 
     // create reactive effect for rendering
     instance.scope.on()
+    // 原来
+    // const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
     const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
-    instance.scope.off()
 
     const update = (instance.update = effect.run.bind(effect))
+    instance.update = effect.run.bind(effect)
     const job: SchedulerJob = (instance.job = effect.runIfDirty.bind(effect))
     job.i = instance
     job.id = instance.uid
-    effect.scheduler = () => queueJob(job)
+    // effect.scheduler = () => queueJob(job)
+    // 手动设置 scheduler 和 scope
+    effect.scheduler = scheduler
+    // scope 可以不设置，或者通过类型断言设置
+    ;(effect as any).scope = instance.scope
 
+    instance.scope.off()
     // allowRecurse
     // #1801, #2043 component render effects should allow recursive updates
     toggleRecurse(instance, true)
@@ -1577,6 +1618,7 @@ function baseCreateRenderer(
     }
 
     update()
+    effect.run()
   }
 
   const updateComponentPreRender = (
@@ -1771,6 +1813,7 @@ function baseCreateRenderer(
     slotScopeIds: string[] | null,
     optimized: boolean,
   ) => {
+    console.log('qnmd')
     let i = 0
     const l2 = c2.length
     let e1 = c1.length - 1 // prev ending index
