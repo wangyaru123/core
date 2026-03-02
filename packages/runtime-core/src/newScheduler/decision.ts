@@ -25,51 +25,14 @@ export class DecisionEngine {
   }
 
   decide(features: FeatureVector): string {
-    const { n, m_est, c, k } = features
-
-    // 使用 ruleEngine 进行规则匹配
-    const ruleStrategy = this.ruleEngine.match(features)
-    if (ruleStrategy) {
-      return ruleStrategy
-    }
-
-    // 1. 优先查询历史反馈
+    // 1. 优先查询历史反馈（若存在且置信度足够）
     const feedbackStrategy = this.feedbackStore.lookup(features)
     if (feedbackStrategy) {
       return feedbackStrategy
     }
 
-    // 2. 规则引擎决策
-    let strategy = 'fast' // 默认策略
-
-    // 高移动比例，根据节点复杂度和 key 稳定性决策
-    if (c > this.thresholds.c_th) {
-      // 节点复杂度高：直接使用快速 Diff
-      return 'fast'
-    }
-
-    if (n < this.thresholds.n1) {
-      // 小规模：朴素Diff
-      strategy = 'simple'
-    } else if (n >= this.thresholds.n2) {
-      // 大规模：快速Diff
-      strategy = 'fast'
-    } else {
-      // 中等规模：基于移动比例
-      if (m_est < this.thresholds.m_th) {
-        strategy = 'doubleEnd'
-      } else {
-        // 高移动比例，需考虑key稳定性
-        if (k < this.thresholds.k_th) {
-          // key稳定性差，降级使用双端Diff
-          strategy = 'doubleEnd'
-        } else {
-          strategy = 'fast'
-        }
-      }
-    }
-
-    return strategy
+    // 2. 无可靠反馈，使用规则引擎进行启发式决策
+    return this.ruleEngine.match(features)
   }
 
   // 反馈记录：更新历史性能数据
@@ -130,6 +93,7 @@ export class DecisionEngine {
     if (n < this.thresholds.n1) return 'simple'
     if (n >= this.thresholds.n2) return 'fast'
     if (m_est < testMth) return 'doubleEnd'
+
     return k < this.thresholds.k_th ? 'doubleEnd' : 'fast'
   }
 }
@@ -214,9 +178,52 @@ interface ThresholdConfig {
   c_th: number
 }
 
-class RuleEngine {
+export class RuleEngine {
+  private thresholds = {
+    n1: 50, // 小规模阈值
+    n2: 500, // 大规模阈值
+    m_th: 0.3, // 移动比例阈值
+    k_th: 0.6, // key 稳定性阈值
+    c_th: 0.5, // 节点复杂度阈值（重型节点比例 >0.5 视为高复杂度）
+  }
+
+  /**
+   * 根据特征向量匹配规则，返回策略名称
+   * @param features 特征向量
+   * @returns 策略名称：'simple' | 'doubleEnd' | 'fast'
+   */
   match(features: FeatureVector): string {
-    // 简化实现，实际由DecisionEngine调用
-    return 'fast'
+    const { n, m_est, c, k } = features
+
+    // 规则 R1：小规模列表，无论其他特征如何，使用朴素 Diff
+    if (n < this.thresholds.n1) {
+      return 'simple'
+    }
+
+    // 规则 R5：大规模列表，直接使用快速 Diff
+    if (n >= this.thresholds.n2) {
+      return 'fast'
+    }
+
+    // 中等规模（50 ≤ n < 500）
+    if (m_est < this.thresholds.m_th) {
+      // 规则 R2：低移动比例，使用双端 Diff
+      return 'doubleEnd'
+    } else {
+      // 高移动比例（m_est ≥ 0.3）
+      if (c >= this.thresholds.c_th) {
+        // 规则 R4：节点复杂度高，直接使用快速 Diff（忽略 key 稳定性）
+        return 'fast'
+      } else {
+        // 节点复杂度低或中，依赖 key 稳定性
+        if (k >= this.thresholds.k_th) {
+          // 规则 R3：key 稳定性高，使用快速 Diff
+          return 'fast'
+        } else {
+          // key 稳定性差，降级使用双端 Diff
+          return 'doubleEnd'
+        }
+      }
+    }
   }
 }

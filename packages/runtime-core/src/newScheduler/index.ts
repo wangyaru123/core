@@ -44,7 +44,7 @@ export function createAdaptiveScheduler(instance: any): any {
     console.log('strategy', strategy)
     console.log('调度开销', performance.now() - startTime)
     // eslint-disable-next-line no-restricted-syntax
-    strategy.beforeUpdate?.()
+    strategy.beforeUpdate?.(instance)
 
     // 4. 记录开始时间（用于反馈）
     const start = performance.now()
@@ -59,7 +59,7 @@ export function createAdaptiveScheduler(instance: any): any {
       // 反馈耗时
       decisionEngine.recordFeedback(features, strategyName, duration)
       // eslint-disable-next-line no-restricted-syntax
-      strategy.afterUpdate?.()
+      strategy.afterUpdate?.(instance)
     })
   }
 }
