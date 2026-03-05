@@ -46,9 +46,9 @@ import {
   type SchedulerJobs,
   flushPostFlushCbs,
   flushPreFlushCbs,
+  queueJob,
   queuePostFlushCb,
 } from './scheduler'
-// queueJob,
 import { createAdaptiveScheduler, initAdaptiveScheduler } from './newScheduler'
 import {
   EffectFlags,
@@ -1343,15 +1343,6 @@ function baseCreateRenderer(
     namespace: ElementNamespace,
     optimized,
   ) => {
-    // 确保调度器已初始化
-    if (!adaptiveSchedulerInitialized) {
-      initAdaptiveScheduler()
-      adaptiveSchedulerInitialized = true
-    }
-    console.log('setupRenderEffect', adaptiveSchedulerInitialized)
-
-    const scheduler = createAdaptiveScheduler(instance)
-
     const componentUpdateFn = () => {
       if (!instance.isMounted) {
         let vnodeHook: VNodeHook | null | undefined
@@ -1622,12 +1613,31 @@ function baseCreateRenderer(
         }
       }
     }
+    // 确保调度器已初始化
+    if (!adaptiveSchedulerInitialized) {
+      initAdaptiveScheduler()
+      adaptiveSchedulerInitialized = true
+    }
 
-    // create reactive effect for rendering
-    instance.scope.on()
+    // 检查组件是否启用了自适应调度器
+    // eslint-disable-next-line no-restricted-syntax
+    const useAdaptive = !!(instance.type as any)?.adaptiveScheduler
+    console.log('useAdaptive', instance)
     // 原来
     // const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
     const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
+    if (useAdaptive) {
+      console.log('使用自适应调度器')
+      // 使用自适应调度器（需要引入 createAdaptiveScheduler）
+      const scheduler = createAdaptiveScheduler(instance)
+      ;(effect as any).scheduler = scheduler
+    } else {
+      // 使用 Vue 原生调度器
+      console.log('使用 Vue 原生调度器')
+      ;(effect as any).scheduler = () => queueJob(instance.update)
+    }
+    // create reactive effect for rendering
+    instance.scope.on()
 
     const update = (instance.update = effect.run.bind(effect))
     instance.update = effect.run.bind(effect)
@@ -1636,7 +1646,7 @@ function baseCreateRenderer(
     job.id = instance.uid
     // effect.scheduler = () => queueJob(job)
     // 手动设置 scheduler 和 scope
-    effect.scheduler = scheduler
+
     // scope 可以不设置，或者通过类型断言设置
     ;(effect as any).scope = instance.scope
 
@@ -1765,6 +1775,232 @@ function baseCreateRenderer(
       )
     }
   }
+  /**
+   * 双端 Diff 算法实现（Vue 2 风格）
+   * 用于处理带 key 的子节点列表更新
+   */
+  const patchChildrenDoubleEnd: PatchChildrenFn = (
+    n1: VNode | null,
+    n2: VNode,
+    container: RendererElement,
+    anchor: RendererNode | null,
+    parentComponent: ComponentInternalInstance | null,
+    parentSuspense: SuspenseBoundary | null,
+    namespace: ElementNamespace,
+    slotScopeIds: string[] | null,
+    optimized = false,
+  ) => {
+    const oldChildren = ((n1 && n1.children) as VNode[]) || []
+    const newChildren = n2.children as VNode[]
+
+    let oldStartIdx = 0
+    let oldEndIdx = oldChildren.length - 1
+    let newStartIdx = 0
+    let newEndIdx = newChildren.length - 1
+
+    let oldStartVnode = oldChildren[oldStartIdx]
+    let oldEndVnode = oldChildren[oldEndIdx]
+    let newStartVnode = newChildren[newStartIdx]
+    let newEndVnode = newChildren[newEndIdx]
+
+    // 用于 key 查找的映射表
+    let oldKeyToIdx: Map<any, number> | undefined
+    let idxInOld: number | undefined
+    let vnodeToMove: VNode
+    let refElm: RendererNode | null
+
+    // 主循环
+    while (oldStartIdx <= oldEndIdx && newStartIdx <= newEndIdx) {
+      // 跳过已处理的空节点（可能被标记为 null）
+      if (oldStartVnode == null) {
+        oldStartVnode = oldChildren[++oldStartIdx]
+      } else if (oldEndVnode == null) {
+        oldEndVnode = oldChildren[--oldEndIdx]
+      } else if (newStartVnode == null) {
+        newStartVnode = newChildren[++newStartIdx]
+      } else if (newEndVnode == null) {
+        newEndVnode = newChildren[--newEndIdx]
+      }
+      // 1. 旧头 vs 新头
+      else if (isSameVNodeType(oldStartVnode, newStartVnode)) {
+        patch(
+          oldStartVnode,
+          newStartVnode,
+          container,
+          null,
+          parentComponent,
+          parentSuspense,
+          namespace,
+          slotScopeIds,
+          optimized,
+        )
+        oldStartVnode = oldChildren[++oldStartIdx]
+        newStartVnode = newChildren[++newStartIdx]
+      }
+      // 2. 旧尾 vs 新尾
+      else if (isSameVNodeType(oldEndVnode, newEndVnode)) {
+        patch(
+          oldEndVnode,
+          newEndVnode,
+          container,
+          null,
+          parentComponent,
+          parentSuspense,
+          namespace,
+          slotScopeIds,
+          optimized,
+        )
+        oldEndVnode = oldChildren[--oldEndIdx]
+        newEndVnode = newChildren[--newEndIdx]
+      }
+      // 3. 旧头 vs 新尾
+      else if (isSameVNodeType(oldStartVnode, newEndVnode)) {
+        patch(
+          oldStartVnode,
+          newEndVnode,
+          container,
+          null,
+          parentComponent,
+          parentSuspense,
+          namespace,
+          slotScopeIds,
+          optimized,
+        )
+        // 将旧头节点移动到旧尾节点之后
+        hostInsert(
+          oldStartVnode.el!,
+          container,
+          // eslint-disable-next-line no-restricted-syntax
+          oldEndVnode.el?.nextSibling || null,
+        )
+        oldStartVnode = oldChildren[++oldStartIdx]
+        newEndVnode = newChildren[--newEndIdx]
+      }
+      // 4. 旧尾 vs 新头
+      else if (isSameVNodeType(oldEndVnode, newStartVnode)) {
+        patch(
+          oldEndVnode,
+          newStartVnode,
+          container,
+          null,
+          parentComponent,
+          parentSuspense,
+          namespace,
+          slotScopeIds,
+          optimized,
+        )
+        // 将旧尾节点移动到旧头节点之前
+        hostInsert(oldEndVnode.el!, container, oldStartVnode.el)
+        oldEndVnode = oldChildren[--oldEndIdx]
+        newStartVnode = newChildren[++newStartIdx]
+      }
+      // 5. 四种匹配均失败，使用 key 查找
+      else {
+        // 建立旧列表当前范围内的 key 到索引的映射（只需一次）
+        if (oldKeyToIdx == null) {
+          oldKeyToIdx = new Map()
+          for (let i = oldStartIdx; i <= oldEndIdx; i++) {
+            const vnode = oldChildren[i]
+            if (vnode != null && vnode.key != null) {
+              oldKeyToIdx.set(vnode.key, i)
+            }
+          }
+        }
+
+        // 尝试用新头节点的 key 查找可复用节点
+        idxInOld =
+          newStartVnode.key != null
+            ? oldKeyToIdx.get(newStartVnode.key)
+            : undefined
+
+        if (idxInOld == null) {
+          // 未找到可复用节点，创建新节点插入到旧头节点之前
+          patch(
+            null,
+            newStartVnode,
+            container,
+            oldStartVnode.el,
+            parentComponent,
+            parentSuspense,
+            namespace,
+            slotScopeIds,
+            optimized,
+          )
+        } else {
+          // 找到可复用节点
+          vnodeToMove = oldChildren[idxInOld]
+          if (isSameVNodeType(vnodeToMove, newStartVnode)) {
+            patch(
+              vnodeToMove,
+              newStartVnode,
+              container,
+              null,
+              parentComponent,
+              parentSuspense,
+              namespace,
+              slotScopeIds,
+              optimized,
+            )
+            // 将找到的节点移动到旧头节点之前
+            hostInsert(vnodeToMove.el!, container, oldStartVnode.el)
+            // 原位置置空，防止重复处理
+            oldChildren[idxInOld] = undefined as any
+          } else {
+            // key 相同但节点类型不同，视为新节点创建
+            patch(
+              null,
+              newStartVnode,
+              container,
+              oldStartVnode.el,
+              parentComponent,
+              parentSuspense,
+              namespace,
+              slotScopeIds,
+              optimized,
+            )
+          }
+        }
+        newStartVnode = newChildren[++newStartIdx]
+      }
+    }
+
+    // 循环结束，处理剩余节点
+    if (oldStartIdx > oldEndIdx) {
+      // 旧节点已处理完，新节点还有剩余 → 挂载新节点
+      // eslint-disable-next-line no-restricted-syntax
+      refElm = newChildren[newEndIdx + 1]?.el || anchor
+      while (newStartIdx <= newEndIdx) {
+        const nextChild = newChildren[newStartIdx]
+        if (nextChild != null) {
+          patch(
+            null,
+            nextChild,
+            container,
+            refElm,
+            parentComponent,
+            parentSuspense,
+            namespace,
+            slotScopeIds,
+            optimized,
+          )
+        }
+        newStartIdx++
+      }
+    } else if (newStartIdx > newEndIdx) {
+      // 新节点已处理完，旧节点还有剩余 → 卸载旧节点
+      while (oldStartIdx <= oldEndIdx) {
+        if (oldChildren[oldStartIdx] != null) {
+          unmount(
+            oldChildren[oldStartIdx],
+            parentComponent,
+            parentSuspense,
+            true,
+          )
+        }
+        oldStartIdx++
+      }
+    }
+  }
   const patchChildrenFast: PatchChildrenFn = (
     n1,
     n2,
@@ -1776,6 +2012,7 @@ function baseCreateRenderer(
     slotScopeIds,
     optimized,
   ) => {
+    console.log('快速diff')
     const c1 = n1 && n1.children
     const prevShapeFlag = n1 ? n1.shapeFlag : 0
     const c2 = n2.children
@@ -1897,17 +2134,17 @@ function baseCreateRenderer(
       return
     } else if (strategy === 'doubleEnd') {
       console.log('双端diff')
-      // patchChildrenDoubleEnd(
-      //   n1,
-      //   n2,
-      //   container,
-      //   anchor,
-      //   parentComponent,
-      //   parentSuspense,
-      //   namespace,
-      //   slotScopeIds,
-      //   optimized,
-      // )
+      patchChildrenDoubleEnd(
+        n1,
+        n2,
+        container,
+        anchor,
+        parentComponent,
+        parentSuspense,
+        namespace,
+        slotScopeIds,
+        optimized,
+      )
       return
     } else {
       // 默认快速 Diff（Vue 3 原生实现）
