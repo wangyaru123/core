@@ -9,7 +9,6 @@ import {
   StrategyPool,
 } from './strategies'
 
-// 为了简化，我们假设这些模块已经实现（可按论文代码实现）
 let monitor: FeatureMonitor
 let decisionEngine: DecisionEngine
 let strategyPool: StrategyPool
