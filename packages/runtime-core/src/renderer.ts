@@ -1613,21 +1613,23 @@ function baseCreateRenderer(
         }
       }
     }
-    // 确保调度器已初始化
-    if (!adaptiveSchedulerInitialized) {
-      initAdaptiveScheduler()
-      adaptiveSchedulerInitialized = true
-    }
 
     // 检查组件是否启用了自适应调度器
-    // eslint-disable-next-line no-restricted-syntax
-    const useAdaptive = !!(instance.type as any)?.adaptiveScheduler
-    console.log('useAdaptive', instance)
+
+    const strategy = instance ? (instance as any).proxy.__diffStrategy : 'fast'
+    // console.log('useAdaptive', instance)
     // 原来
     // const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
     const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
-    if (useAdaptive) {
+    if (strategy === 'adaptiveScheduler') {
       console.log('使用自适应调度器')
+
+      // 确保调度器已初始化
+      if (!adaptiveSchedulerInitialized) {
+        initAdaptiveScheduler()
+        adaptiveSchedulerInitialized = true
+      }
+
       // 使用自适应调度器（需要引入 createAdaptiveScheduler）
       const scheduler = createAdaptiveScheduler(instance)
       ;(effect as any).scheduler = scheduler
@@ -1688,91 +1690,79 @@ function baseCreateRenderer(
   }
 
   /**
-   * 朴素 Diff 算法实现
-   * 用于处理不需要复杂 diff 的场景，如无 key 的列表
-   *
-   * @param n1 旧 VNode
-   * @param n2 新 VNode
-   * @param container 容器元素
-   * @param anchor 锚点节点
-   * @param parentComponent 父组件实例
-   * @param parentSuspense 父 Suspense
-   * @param namespace 元素命名空间
-   * @param slotScopeIds 插槽作用域 ID
-   * @param optimized 是否优化模式
+   * 朴素 Diff 算法（双重循环）
+   * 对于新列表的每个节点，遍历旧列表查找可复用节点。
+   * 该算法时间复杂度 O(n²)，仅适用于极小规模列表。
    */
   const patchChildrenSimple: PatchChildrenFn = (
-    n1: VNode | null,
-    n2: VNode,
-    container: RendererElement,
-    anchor: RendererNode | null,
-    parentComponent: ComponentInternalInstance | null,
-    parentSuspense: SuspenseBoundary | null,
-    namespace: ElementNamespace,
-    slotScopeIds: string[] | null,
+    n1,
+    n2,
+    container,
+    anchor,
+    parentComponent,
+    parentSuspense,
+    namespace,
+    slotScopeIds,
     optimized = false,
   ) => {
-    console.log('patchChildrenSimple')
-    // 获取新旧子节点数组，确保不为空
-    const c1 = n1 && n1.children ? (n1.children as VNode[]) : []
-    const c2 = n2.children as VNode[]
+    const oldChildren = ((n1 && n1.children) as VNode[]) || []
+    const newChildren = n2.children as VNode[]
 
-    const oldLen = c1.length
-    const newLen = c2.length
-    const commonLength = Math.min(oldLen, newLen)
+    // 用于标记旧节点是否已被复用
+    const oldUsed = new Array(oldChildren.length).fill(false)
 
-    let i: number
+    // 第一重循环：遍历新节点
+    for (let i = 0; i < newChildren.length; i++) {
+      const newVNode = newChildren[i]
+      let found = false
 
-    // 1. 遍历公共长度部分，依次 patch
-    for (i = 0; i < commonLength; i++) {
-      const nextChild = (c2[i] = optimized
-        ? cloneIfMounted(c2[i] as VNode)
-        : normalizeVNode(c2[i]))
+      // 第二重循环：在旧节点中查找可复用的节点
+      for (let j = 0; j < oldChildren.length; j++) {
+        const oldVNode = oldChildren[j]
+        if (!oldUsed[j] && isSameVNodeType(oldVNode, newVNode)) {
+          // 找到可复用节点，执行 patch 更新
+          patch(
+            oldVNode,
+            newVNode,
+            container,
+            null, // 锚点暂时传 null，实际位置由外层 patchChildren 决定
+            parentComponent,
+            parentSuspense,
+            namespace,
+            slotScopeIds,
+            optimized,
+          )
+          oldUsed[j] = true
+          found = true
+          break
+        }
+      }
 
-      patch(
-        c1[i],
-        nextChild,
-        container,
-        null, // 这里用 null 而不是 anchor，因为位置固定
-        parentComponent,
-        parentSuspense,
-        namespace,
-        slotScopeIds,
-        optimized,
-      )
+      if (!found) {
+        // 未找到可复用节点，创建新节点
+        // 需要确定插入位置：在新列表中，当前节点之前的所有节点都已处理，
+        // 因此可以以新列表的下一个节点作为锚点
+        // eslint-disable-next-line no-restricted-syntax
+        const refNode = newChildren[i + 1]?.el || anchor
+        patch(
+          null,
+          newVNode,
+          container,
+          refNode,
+          parentComponent,
+          parentSuspense,
+          namespace,
+          slotScopeIds,
+          optimized,
+        )
+      }
     }
 
-    // 2. 处理剩余节点
-    if (oldLen > newLen) {
-      // 旧节点多，卸载多余的旧节点
-      unmountChildren(
-        c1,
-        parentComponent,
-        parentSuspense,
-        true, // 是否移除父节点
-        false,
-        commonLength, // 从 commonLength 开始
-      )
-    } else if (newLen > oldLen) {
-      // 新节点多，挂载多余的新节点
-      // 计算正确的锚点位置
-
-      const curAnchor =
-        newLen - commonLength > 0 && c2[commonLength] && c2[commonLength].el
-          ? c2[commonLength].el
-          : anchor
-
-      mountChildren(
-        c2,
-        container,
-        curAnchor,
-        parentComponent,
-        parentSuspense,
-        namespace,
-        slotScopeIds,
-        optimized,
-        commonLength,
-      )
+    // 删除未被复用的旧节点
+    for (let j = 0; j < oldChildren.length; j++) {
+      if (!oldUsed[j]) {
+        unmount(oldChildren[j], parentComponent, parentSuspense, true)
+      }
     }
   }
   /**
@@ -2012,7 +2002,6 @@ function baseCreateRenderer(
     slotScopeIds,
     optimized,
   ) => {
-    console.log('快速diff')
     const c1 = n1 && n1.children
     const prevShapeFlag = n1 ? n1.shapeFlag : 0
     const c2 = n2.children
@@ -2103,7 +2092,7 @@ function baseCreateRenderer(
       }
     }
   }
-
+  type Strategy = 'simple' | 'doubleEnd' | 'fast'
   const patchChildren: PatchChildrenFn = (
     n1,
     n2,
@@ -2117,8 +2106,12 @@ function baseCreateRenderer(
   ) => {
     // 获取当前组件实例（注意 parentComponent 可能就是组件实例）
     const instance = parentComponent
-    const strategy = instance ? (instance as any).__diffStrategy : null
+    const strategy = instance
+      ? (instance as any).proxy.__diffStrategy
+      : ('fast' as Strategy)
+    // const strategy = 'fast' as Strategy
     console.log('patchChildren--策略', strategy)
+
     if (strategy === 'simple') {
       patchChildrenSimple(
         n1,
@@ -2133,7 +2126,6 @@ function baseCreateRenderer(
       )
       return
     } else if (strategy === 'doubleEnd') {
-      console.log('双端diff')
       patchChildrenDoubleEnd(
         n1,
         n2,
@@ -2234,7 +2226,6 @@ function baseCreateRenderer(
     slotScopeIds: string[] | null,
     optimized: boolean,
   ) => {
-    console.log('patchKeyedChildren')
     let i = 0
     const l2 = c2.length
     let e1 = c1.length - 1 // prev ending index

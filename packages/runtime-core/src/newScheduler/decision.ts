@@ -16,20 +16,20 @@ export class DecisionEngine {
     this.ruleEngine = new RuleEngine()
     this.feedbackStore = new FeedbackStore()
     this.thresholds = {
-      n1: 50, // 小规模阈值
-      n2: 500, // 大规模阈值
+      n1: 35, // 小规模阈值
+      n2: 520, // 大规模阈值
       m_th: 0.3, // 移动比例阈值
-      k_th: 0.6, // key稳定性阈值
       c_th: 0.5, // 重型节点比例 > 0.5 视为高复杂度
+      k_th: 0.6, // key稳定性阈值
     }
   }
 
   decide(features: FeatureVector): string {
     // 1. 优先查询历史反馈（若存在且置信度足够）
-    const feedbackStrategy = this.feedbackStore.lookup(features)
-    if (feedbackStrategy) {
-      return feedbackStrategy
-    }
+    // const feedbackStrategy = this.feedbackStore.lookup(features)
+    // if (feedbackStrategy) {
+    //   return feedbackStrategy
+    // }
 
     // 2. 无可靠反馈，使用规则引擎进行启发式决策
     return this.ruleEngine.match(features)
@@ -213,7 +213,7 @@ export class RuleEngine {
       // 高移动比例（m_est ≥ 0.3）
       if (c >= this.thresholds.c_th) {
         // 规则 R4：节点复杂度高，直接使用快速 Diff（忽略 key 稳定性）
-        return 'fast'
+        return 'doubleEnd'
       } else {
         // 节点复杂度低或中，依赖 key 稳定性
         if (k >= this.thresholds.k_th) {
