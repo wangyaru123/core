@@ -1,10 +1,11 @@
-/* eslint-disable no-console */
 import type { VNode } from 'vue'
 import type { FeatureVector } from './types'
 import type { ComponentInternalInstance } from '../component'
 export class FeatureMonitor {
   private lastKeyMap: Map<string, string> = new Map() // 用于key稳定性历史记录
   private readonly SAMPLE_SIZE = 20 // 节点复杂度采样数
+  private prevChildren: VNode[] = [] // 上一次更新周期的子节点列表（移动比例估算的“旧节点”）
+  private readonly ANCHOR_COUNT = 10 // 移动比例估算锚点数（论文要求等距取 10 锚点）
 
   collect(instance: any): FeatureVector {
     // 获取当前正在更新的组件及其子节点
@@ -13,7 +14,7 @@ export class FeatureMonitor {
     // 1. 列表长度特征 - 直接读取 O(1)
     const n = currentChildren.length
 
-    // 2. 移动比例估算 - 基于三节点采样 O(1)
+    // 2. 移动比例估算 - 基于等距采样 O(10)
     const m_est = this.estimateMoveRatio(currentChildren)
 
     // 3. 节点复杂度 - 固定采样检测 O(20)
@@ -22,30 +23,30 @@ export class FeatureMonitor {
     // 4. key稳定性 - 综合系数计算
     const k = this.computeKeyStability(currentChildren)
 
+    // 保存当前子节点，供下一轮 collect 估算移动比例时作为“旧子节点”
+    this.prevChildren = currentChildren
+
     return { n, m_est, c, k }
   }
 
   private estimateMoveRatio(newChildren: VNode[]): number {
-    // 获取旧节点列表（从Vue内部获取，此处简化）
+    // 获取旧节点列表（上一轮 collect 保存的子节点）
     const oldChildren = this.getOldChildren()
-    if (oldChildren.length < 3) return 0.0
+    const sampleCount = Math.min(this.ANCHOR_COUNT, oldChildren.length)
+    if (sampleCount === 0) return 0.0
 
-    // 选取头、中、尾三个锚点
-    const headIdx = 0
-    const midIdx = Math.floor((oldChildren.length - 1) / 2)
-    const tailIdx = oldChildren.length - 1
-
-    const anchors = [
-      { node: oldChildren[headIdx], oldIdx: headIdx },
-      { node: oldChildren[midIdx], oldIdx: midIdx },
-      { node: oldChildren[tailIdx], oldIdx: tailIdx },
-    ]
-
+    // 等距选取锚点（论文要求 10 锚点，不足 10 个时全部采样）
     let movedCount = 0
-    anchors.forEach(({ node, oldIdx }) => {
+    for (let i = 0; i < sampleCount; i++) {
+      const oldIdx =
+        sampleCount === 1
+          ? 0
+          : Math.floor((i * (oldChildren.length - 1)) / (sampleCount - 1))
+      const node = oldChildren[oldIdx]
+
       if (!node.key) {
         movedCount++ // 无key节点视为需要移动
-        return
+        continue
       }
 
       // 在新列表中查找该节点（通过key映射）
@@ -56,9 +57,9 @@ export class FeatureMonitor {
         movedCount++ // 位置变化
       }
       // 位置相同则不计入移动
-    })
+    }
 
-    return movedCount / 3
+    return movedCount / sampleCount
   }
 
   private detectNodeComplexity(children: VNode[]): number {
@@ -93,29 +94,22 @@ export class FeatureMonitor {
   }
 
   private computeKeyStability(children: VNode[]): number {
-    console.log('computeKeyStability--start')
-    console.log('传参--children', children)
+    // 空列表直接返回 0，避免 0/0 产生 NaN
+    if (children.length === 0) return 0
+
     // 来源权重 (25%)
     let srcWeight = 0
-    // 从0开始，递增+1数组
-    const arr = Array.from({ length: children.length }, (_, i) => i)
-    console.log('arr', arr)
-
     children.forEach((vnode, index) => {
-      console.log('vnode', vnode)
-      console.log('typeof vnode.key', typeof vnode.key)
-      console.log('index === arr[index]', index === arr[index])
-
       if (!vnode.key) {
         srcWeight += 0
-      } else if (typeof vnode.key === 'number' && index === arr[index]) {
-        srcWeight += 0.3 // 数组索引
+      } else if (vnode.key === index) {
+        // key 等于当前索引 → 索引作为 key（来源为数组索引）
+        srcWeight += 0.3
       } else {
         srcWeight += 1.0 // 其他-业务数据
       }
     })
     srcWeight = srcWeight / children.length
-    console.log('srcWeight', srcWeight)
 
     // 唯一性因子 (50%)
     const keySet = new Set()
@@ -136,14 +130,16 @@ export class FeatureMonitor {
       if (lastKey === vnode.key) historyStability++
       this.lastKeyMap.set(this.getNodeId(vnode), vnode.key as string)
     })
-    console.log('historyStability', historyStability)
     historyStability = historyStability / children.length
 
     // 加权合成
     return 0.25 * srcWeight + 0.5 * uniqFactor + 0.25 * historyStability
   }
 
-  private findListContainer(vnode: VNode): VNode | null {
+  private findListContainer(vnode: VNode | null): VNode | null {
+    // 跳过 null 节点（条件渲染/fragment 会产生 null）
+    if (vnode == null) return null
+
     // 检查当前节点是否有标记属性
     if (vnode.props && vnode.props['data-monitor-list'] !== undefined) {
       return vnode
@@ -151,7 +147,7 @@ export class FeatureMonitor {
     // 递归遍历子节点
     if (vnode.children && Array.isArray(vnode.children)) {
       for (const child of vnode.children) {
-        const found = this.findListContainer(child as VNode)
+        const found = this.findListContainer(child as VNode | null)
         if (found) return (found.children as VNode[])[0]
       }
     }
@@ -161,11 +157,6 @@ export class FeatureMonitor {
   private getCurrentChildren(instance: ComponentInternalInstance): VNode[] {
     const subTree = instance.subTree
     const container = this.findListContainer(subTree)
-    console.log('container', container)
-    console.log(
-      'container && container.children && Array.isArray(container.children)',
-      container && container.children && Array.isArray(container.children),
-    )
     if (container && container.children && Array.isArray(container.children)) {
       return container.children as VNode[]
     }
@@ -173,7 +164,8 @@ export class FeatureMonitor {
     return []
   }
   private getOldChildren(): VNode[] {
-    /* 从Vue内部获取 */ return []
+    // 返回上一轮 collect 保存的旧子节点列表
+    return this.prevChildren
   }
   private findIndexByKey(children: VNode[], key: any): number {
     return children.findIndex(v => v.key === key)

@@ -127,7 +127,13 @@ export { useSSRContext, ssrContextKey } from './helpers/useSsrContext'
 
 // Custom Renderer API ---------------------------------------------------------
 
-export { createRenderer, createHydrationRenderer } from './renderer'
+export {
+  createRenderer,
+  createHydrationRenderer,
+  startDiffTiming,
+  collectDiffTiming,
+  getLastDispatchedStrategy,
+} from './renderer'
 export { queuePostFlushCb } from './scheduler'
 import { warn as _warn } from './warning'
 export const warn = (__DEV__ ? _warn : NOOP) as typeof _warn

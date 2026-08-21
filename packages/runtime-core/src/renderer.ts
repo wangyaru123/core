@@ -1,4 +1,42 @@
-/* eslint-disable no-console */
+// Diff 计时累加器（模块级，供实验代码精确测量 Diff 算法耗时）
+// 每次 patchChildren 执行时，如果计时已启动，则按策略累加耗时
+let diffTimingActive = false
+const diffTimingTotals: Record<string, number> = {}
+
+/**
+ * 启动 Diff 计时：重置累加器，开始收集后续 patchChildren 调用的耗时
+ */
+export function startDiffTiming(): void {
+  diffTimingActive = true
+  for (const key in diffTimingTotals) {
+    delete diffTimingTotals[key]
+  }
+}
+
+/**
+ * 停止计时并返回本次更新周期内各策略的累加耗时
+ * @returns 如 { simple: 0.012, fast: 0.003 } 或 {}（如果没有 patchChildren 调用）
+ */
+export function collectDiffTiming(): Record<string, number> {
+  diffTimingActive = false
+  // eslint-disable-next-line no-restricted-syntax
+  const result = { ...diffTimingTotals }
+  for (const key in diffTimingTotals) {
+    delete diffTimingTotals[key]
+  }
+  return result
+}
+
+// 分支命中记录（模块级，供 E2 集成测试观测 patchChildren 实际分发的策略分支）
+let lastDispatchedStrategy: string | null = null
+
+/**
+ * 返回最近一次 patchChildren 实际分发的策略分支（'simple' | 'doubleEnd' | 'fast'）
+ */
+export function getLastDispatchedStrategy(): string | null {
+  return lastDispatchedStrategy
+}
+
 import {
   Comment,
   Fragment,
@@ -1614,45 +1652,30 @@ function baseCreateRenderer(
       }
     }
 
-    // 检查组件是否启用了自适应调度器
-
-    const strategy = instance ? (instance as any).proxy.__diffStrategy : 'fast'
-    // console.log('useAdaptive', instance)
-    // 原来
-    // const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
+    // create reactive effect for rendering
+    instance.scope.on()
     const effect = (instance.effect = new ReactiveEffect(componentUpdateFn))
-    if (strategy === 'adaptiveScheduler') {
-      console.log('使用自适应调度器')
+    instance.scope.off()
 
-      // 确保调度器已初始化
+    const update = (instance.update = effect.run.bind(effect))
+    const job: SchedulerJob = (instance.job = effect.runIfDirty.bind(effect))
+    job.i = instance
+    job.id = instance.uid
+
+    // 设置调度器：自适应调度器 or Vue 原生调度器
+    if (true) {
+      // 确保自适应调度器已初始化
       if (!adaptiveSchedulerInitialized) {
         initAdaptiveScheduler()
         adaptiveSchedulerInitialized = true
       }
-
-      // 使用自适应调度器（需要引入 createAdaptiveScheduler）
-      const scheduler = createAdaptiveScheduler(instance)
-      ;(effect as any).scheduler = scheduler
+      // 使用自适应调度器，传入 job（具有 flags/id/i 属性）
+      ;(effect as any).scheduler = createAdaptiveScheduler(instance, job)
     } else {
       // 使用 Vue 原生调度器
-      console.log('使用 Vue 原生调度器')
-      ;(effect as any).scheduler = () => queueJob(instance.update)
+      ;(effect as any).scheduler = () => queueJob(job)
     }
-    // create reactive effect for rendering
-    instance.scope.on()
 
-    const update = (instance.update = effect.run.bind(effect))
-    instance.update = effect.run.bind(effect)
-    const job: SchedulerJob = (instance.job = effect.runIfDirty.bind(effect))
-    job.i = instance
-    job.id = instance.uid
-    // effect.scheduler = () => queueJob(job)
-    // 手动设置 scheduler 和 scope
-
-    // scope 可以不设置，或者通过类型断言设置
-    ;(effect as any).scope = instance.scope
-
-    instance.scope.off()
     // allowRecurse
     // #1801, #2043 component render effects should allow recursive updates
     toggleRecurse(instance, true)
@@ -1667,7 +1690,6 @@ function baseCreateRenderer(
     }
 
     update()
-    effect.run()
   }
 
   const updateComponentPreRender = (
@@ -1720,12 +1742,12 @@ function baseCreateRenderer(
       for (let j = 0; j < oldChildren.length; j++) {
         const oldVNode = oldChildren[j]
         if (!oldUsed[j] && isSameVNodeType(oldVNode, newVNode)) {
-          // 找到可复用节点，执行 patch 更新
+          // 找到可复用节点，执行 patch 更新内容
           patch(
             oldVNode,
             newVNode,
             container,
-            null, // 锚点暂时传 null，实际位置由外层 patchChildren 决定
+            null,
             parentComponent,
             parentSuspense,
             namespace,
@@ -1734,16 +1756,33 @@ function baseCreateRenderer(
           )
           oldUsed[j] = true
           found = true
+
+          // 目标位置：紧邻前一个新节点之后（新列表第 i 位）。
+          // 由于向前遍历，前一个新节点已在上一次迭代就位，其 el 可直接作为锚点，
+          // 避免依赖尚未处理的新节点 el（原实现此处恒取末尾 anchor，导致
+          // “尾部追加/删除”等无移动场景也付出 O(n) 次 DOM 移动成本）。
+
+          const prevNode = newChildren[i - 1]
+          // eslint-disable-next-line no-restricted-syntax
+          const refNode = prevNode?.el
+            ? prevNode.el.nextSibling
+            : container.firstChild
+          // 仅当节点不在目标位置时才移动（对齐论文算法3：只 patch，不逐节点移动）
+          if (oldVNode.el !== refNode) {
+            hostInsert(oldVNode.el!, container, refNode)
+          }
           break
         }
       }
 
       if (!found) {
-        // 未找到可复用节点，创建新节点
-        // 需要确定插入位置：在新列表中，当前节点之前的所有节点都已处理，
-        // 因此可以以新列表的下一个节点作为锚点
+        // 未找到可复用节点，创建新节点并插入到目标位置（紧邻前一个新节点之后）
+
+        const prevNode = newChildren[i - 1]
         // eslint-disable-next-line no-restricted-syntax
-        const refNode = newChildren[i + 1]?.el || anchor
+        const refNode = prevNode?.el
+          ? prevNode.el.nextSibling
+          : container.firstChild
         patch(
           null,
           newVNode,
@@ -2007,6 +2046,33 @@ function baseCreateRenderer(
     const c2 = n2.children
 
     const { patchFlag, shapeFlag } = n2
+
+    // 当策略选择器指定 fast 策略时，确保走 patchKeyedChildren（LIS算法）
+    // 而不是 patchUnkeyedChildren，以保证与论文定义的快速Diff一致
+    // eslint-disable-next-line no-restricted-syntax
+    const currentStrategy = parentComponent
+      ? (parentComponent as any).proxy?.__diffStrategy
+      : null
+    if (currentStrategy === 'fast') {
+      // 快速Diff策略：新旧子节点都是数组时，直接走 patchKeyedChildren
+      if (
+        prevShapeFlag & ShapeFlags.ARRAY_CHILDREN &&
+        shapeFlag & ShapeFlags.ARRAY_CHILDREN
+      ) {
+        patchKeyedChildren(
+          c1 as VNode[],
+          c2 as VNodeArrayChildren,
+          container,
+          anchor,
+          parentComponent,
+          parentSuspense,
+          namespace,
+          slotScopeIds,
+          optimized,
+        )
+        return
+      }
+    }
     // fast path
     if (patchFlag > 0) {
       if (patchFlag & PatchFlags.KEYED_FRAGMENT) {
@@ -2093,6 +2159,7 @@ function baseCreateRenderer(
     }
   }
   type Strategy = 'simple' | 'doubleEnd' | 'fast'
+
   const patchChildren: PatchChildrenFn = (
     n1,
     n2,
@@ -2109,10 +2176,13 @@ function baseCreateRenderer(
     const strategy = instance
       ? (instance as any).proxy.__diffStrategy
       : ('fast' as Strategy)
-    // const strategy = 'fast' as Strategy
-    console.log('patchChildren--策略', strategy)
+
+    // Diff 计时：如果计时已启动，记录算法执行耗时并累加
+    const doTiming = diffTimingActive
+    const diffStart = doTiming ? performance.now() : 0
 
     if (strategy === 'simple') {
+      lastDispatchedStrategy = 'simple'
       patchChildrenSimple(
         n1,
         n2,
@@ -2124,8 +2194,13 @@ function baseCreateRenderer(
         slotScopeIds,
         optimized,
       )
+      if (doTiming) {
+        const d = performance.now() - diffStart
+        diffTimingTotals['simple'] = (diffTimingTotals['simple'] || 0) + d
+      }
       return
     } else if (strategy === 'doubleEnd') {
+      lastDispatchedStrategy = 'doubleEnd'
       patchChildrenDoubleEnd(
         n1,
         n2,
@@ -2137,9 +2212,14 @@ function baseCreateRenderer(
         slotScopeIds,
         optimized,
       )
+      if (doTiming) {
+        const d = performance.now() - diffStart
+        diffTimingTotals['doubleEnd'] = (diffTimingTotals['doubleEnd'] || 0) + d
+      }
       return
     } else {
       // 默认快速 Diff（Vue 3 原生实现）
+      lastDispatchedStrategy = 'fast'
       patchChildrenFast(
         n1,
         n2,
@@ -2151,6 +2231,10 @@ function baseCreateRenderer(
         slotScopeIds,
         optimized,
       )
+      if (doTiming) {
+        const d = performance.now() - diffStart
+        diffTimingTotals['fast'] = (diffTimingTotals['fast'] || 0) + d
+      }
       return
     }
   }

@@ -16,11 +16,11 @@ export class DecisionEngine {
     this.ruleEngine = new RuleEngine()
     this.feedbackStore = new FeedbackStore()
     this.thresholds = {
-      n1: 35, // 小规模阈值
-      n2: 520, // 大规模阈值
-      m_th: 0.3, // 移动比例阈值
-      c_th: 0.5, // 重型节点比例 > 0.5 视为高复杂度
-      k_th: 0.6, // key稳定性阈值
+      n1: 50, // 小规模阈值（论文表3-1）
+      n2: 500, // 大规模阈值（论文表3-1）
+      m_th: 0.3, // 移动比例阈值（论文图3-6）
+      c_th: 0.5, // 节点复杂度阈值（论文图3-7）
+      k_th: 0.65, // key稳定性阈值（论文图3-8）
     }
   }
 
@@ -180,47 +180,48 @@ interface ThresholdConfig {
 
 export class RuleEngine {
   private thresholds = {
-    n1: 50, // 小规模阈值
-    n2: 500, // 大规模阈值
-    m_th: 0.3, // 移动比例阈值
-    k_th: 0.6, // key 稳定性阈值
-    c_th: 0.5, // 节点复杂度阈值（重型节点比例 >0.5 视为高复杂度）
+    n1: 50, // 小规模阈值（论文表3-1）
+    n2: 500, // 大规模阈值（论文表3-1）
+    m_th: 0.3, // 移动比例阈值（论文图3-6）
+    k_th: 0.65, // key 稳定性阈值（论文图3-8）
+    c_th: 0.5, // 节点复杂度阈值（论文图3-7）
   }
 
   /**
    * 根据特征向量匹配规则，返回策略名称
+   * 对应论文表3-2的决策规则表
    * @param features 特征向量
    * @returns 策略名称：'simple' | 'doubleEnd' | 'fast'
    */
   match(features: FeatureVector): string {
     const { n, m_est, c, k } = features
 
-    // 规则 R1：小规模列表，无论其他特征如何，使用朴素 Diff
+    // 规则 R1：n < 50，使用朴素 Diff
     if (n < this.thresholds.n1) {
       return 'simple'
     }
 
-    // 规则 R5：大规模列表，直接使用快速 Diff
+    // 规则 R2：n ≥ 500，使用快速 Diff
     if (n >= this.thresholds.n2) {
       return 'fast'
     }
 
     // 中等规模（50 ≤ n < 500）
     if (m_est < this.thresholds.m_th) {
-      // 规则 R2：低移动比例，使用双端 Diff
+      // 规则 R3：50≤n<500 且 m<0.3，使用双端 Diff
       return 'doubleEnd'
     } else {
       // 高移动比例（m_est ≥ 0.3）
-      if (c >= this.thresholds.c_th) {
-        // 规则 R4：节点复杂度高，直接使用快速 Diff（忽略 key 稳定性）
+      if (c > this.thresholds.c_th) {
+        // 规则 R4：50≤n<500 且 m≥0.3 且 c>0.5，使用双端 Diff
         return 'doubleEnd'
       } else {
-        // 节点复杂度低或中，依赖 key 稳定性
+        // 节点复杂度低或中（c ≤ 0.5），依赖 key 稳定性
         if (k >= this.thresholds.k_th) {
-          // 规则 R3：key 稳定性高，使用快速 Diff
+          // 规则 R6：50≤n<500 且 m≥0.3 且 c≤0.5 且 k≥0.65，使用快速 Diff
           return 'fast'
         } else {
-          // key 稳定性差，降级使用双端 Diff
+          // 规则 R5：50≤n<500 且 m≥0.3 且 c≤0.5 且 k<0.65，使用双端 Diff
           return 'doubleEnd'
         }
       }
